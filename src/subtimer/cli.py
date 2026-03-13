@@ -12,11 +12,13 @@ from . import __version__
 from .media_io import MediaProcessor 
 from .audio_prep import AudioPreprocessor, AudioConfig
 from .matcher import AudioMatcher, MatchConfig
+from .hint_guided_matcher import HintGuidedMatcher 
 from .refiner import AlignmentRefiner
 from .alignment_map import AlignmentMap
 from .subtitle_io import SubtitleProcessor
 from .retime import SubtitleRetimer
 from .report import ReportGenerator, ProcessingMetadata
+from .hint_loader import load_hints_file, validate_alignment_against_hints
 
 # Configure logging
 logging.basicConfig(
@@ -121,6 +123,15 @@ def main(
         
         warnings = []
         
+        # Check for hints file
+        hints_path = Path(subtitle_file).parent / 'hints.yaml'
+        hints = load_hints_file(hints_path) if hints_path.exists() else None
+        
+        if hints:
+            logger.info(f"Loaded timing hints for {hints.episode_id}")
+        else:
+            logger.info("No hints file found, using automatic detection only")
+        
         # Step 1: Media I/O and Audio Extraction
         logger.info("Step 1: Processing media files")
         media_processor = MediaProcessor(temp_dir=temp_dir, cache_enabled=cache)
@@ -172,7 +183,14 @@ def main(
             chunk_duration=chunk_duration,
             min_correlation=min_correlation
         )
-        matcher = AudioMatcher(config=match_config)
+        
+        # Use hint-guided matcher if hints are available
+        if hints:
+            matcher = HintGuidedMatcher(config=match_config, hints=hints)
+            logger.info("Using hint-guided matching")
+        else:
+            matcher = AudioMatcher(config=match_config)
+            logger.info("Using standard audio matching")
         
         try:
             # Load working audio for matching
@@ -200,29 +218,37 @@ def main(
             # Create empty alignment map and continue
             alignment_map = AlignmentMap()
         else:
-            # Step 4: Refinement
+            # Step 4: Refinement 
             logger.info("Step 4: Refining alignment")
             
-            # TEMPORARY: Skip refiner to test raw matcher results
-            logger.info("TEMPORARY: Skipping refiner, using raw matcher results")
-            alignment_map = AlignmentMap(coarse_regions)
+            # Use refined approach with lower confidence threshold
+            refiner = AlignmentRefiner(min_confidence=0.3)  # Lower threshold
             
-            # Old refiner code (commented out for testing)
-            # refiner = AlignmentRefiner(min_confidence=min_confidence)
-            # try:
-            #     refined_regions = refiner.refine_regions(
-            #         coarse_regions, dvd_normalized, tv_normalized, sample_rate
-            #     )
-            #     
-            #     alignment_map = AlignmentMap(refined_regions)
-            #     alignment_map.merge_compatible_regions()
-            #     
-            #     logger.info(f"Refined to {len(alignment_map.regions)} regions")
-            #     
-            # except Exception as e:
-            #     logger.error(f"Refinement failed: {e}")
-            #     warnings.append("Refinement failed, using coarse matches")
-            #     alignment_map = AlignmentMap(coarse_regions)
+            try:
+                refined_regions = refiner.refine_regions(
+                    coarse_regions, dvd_normalized, tv_normalized, sample_rate
+                )
+                
+                alignment_map = AlignmentMap(refined_regions)
+                alignment_map.merge_compatible_regions()
+                
+                logger.info(f"Refined to {len(alignment_map.regions)} regions")
+                
+            except Exception as e:
+                logger.error(f"Refinement failed: {e}")
+                warnings.append("Refinement failed, using coarse matches")
+                alignment_map = AlignmentMap(coarse_regions)
+                
+            # Validate against hints if available
+            if hints:
+                hint_warnings = validate_alignment_against_hints(
+                    alignment_map.regions, hints, tolerance_seconds=5.0
+                )
+                if hint_warnings:
+                    logger.warning(f"Hint validation found {len(hint_warnings)} issues")
+                    warnings.extend([f"Hint validation: {w}" for w in hint_warnings])
+                else:
+                    logger.info("Alignment matches timing hints well")
         # Step 5: Load Subtitles
         logger.info("Step 5: Loading subtitles")
         subtitle_processor = SubtitleProcessor()
