@@ -218,27 +218,13 @@ def main(
             # Create empty alignment map and continue
             alignment_map = AlignmentMap()
         else:
-            # Step 4: Refinement 
+            # Step 4: Refinement
             logger.info("Step 4: Refining alignment")
             
-            # Use refined approach with lower confidence threshold
-            refiner = AlignmentRefiner(min_confidence=0.3)  # Lower threshold
+            # TEMPORARY: Skip refiner since it's breaking good correlations
+            logger.info("Bypassing refiner to preserve hint-guided matches")
+            alignment_map = AlignmentMap(coarse_regions)
             
-            try:
-                refined_regions = refiner.refine_regions(
-                    coarse_regions, dvd_normalized, tv_normalized, sample_rate
-                )
-                
-                alignment_map = AlignmentMap(refined_regions)
-                alignment_map.merge_compatible_regions()
-                
-                logger.info(f"Refined to {len(alignment_map.regions)} regions")
-                
-            except Exception as e:
-                logger.error(f"Refinement failed: {e}")
-                warnings.append("Refinement failed, using coarse matches")
-                alignment_map = AlignmentMap(coarse_regions)
-                
             # Validate against hints if available
             if hints:
                 hint_warnings = validate_alignment_against_hints(
