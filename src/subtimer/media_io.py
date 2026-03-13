@@ -3,13 +3,56 @@
 Handles probing inputs, extracting audio with FFmpeg, and managing temp/cache files.
 """
 
+import json
 import logging
 import subprocess
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, Union
 
 logger = logging.getLogger(__name__)
+
+
+def find_ffmpeg_executable(name: str) -> str:
+    """Find FFmpeg executable (ffprobe or ffmpeg) in system PATH or common locations.
+    
+    Args:
+        name: Executable name ('ffprobe' or 'ffmpeg').
+        
+    Returns:
+        Full path to executable.
+        
+    Raises:
+        FileNotFoundError: If executable not found.
+    """
+    # First try system PATH
+    exe_path = shutil.which(name)
+    if exe_path:
+        return exe_path
+        
+    # Common Windows installation paths
+    common_paths = [
+        # WinGet installation
+        os.path.expandvars(r"$LOCALAPPDATA\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin"),
+        # Other common paths
+        r"C:\Program Files\ffmpeg\bin",
+        r"C:\Program Files (x86)\ffmpeg\bin", 
+        r"C:\ffmpeg\bin",
+        os.path.expanduser("~/ffmpeg/bin"),
+    ]
+    
+    # Check common paths
+    for path_dir in common_paths:
+        if os.path.exists(path_dir):
+            exe_full_path = os.path.join(path_dir, f"{name}.exe")
+            if os.path.exists(exe_full_path):
+                logger.info(f"Found {name} at: {exe_full_path}")
+                return exe_full_path
+                
+    # If not found, return original name and let subprocess handle the error
+    raise FileNotFoundError(f"Could not find {name} executable. Please ensure FFmpeg is installed.")
 
 
 @dataclass
@@ -54,9 +97,16 @@ class MediaProcessor:
         if not media_path.exists():
             raise FileNotFoundError(f"Media file not found: {media_path}")
             
+        # Find ffprobe executable
+        try:
+            ffprobe_path = find_ffmpeg_executable("ffprobe")
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            raise
+            
         # Use ffprobe to get media information
         cmd = [
-            "ffprobe",
+            ffprobe_path,
             "-v", "quiet",
             "-print_format", "json",
             "-show_format",
@@ -66,7 +116,7 @@ class MediaProcessor:
         
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            data = eval(result.stdout)  # TODO: Use json.loads for safety
+            data = json.loads(result.stdout)  # Safely parse JSON
             
             # Extract audio stream info
             audio_stream = None
@@ -124,9 +174,16 @@ class MediaProcessor:
             logger.info(f"Using cached audio: {output_path}")
             return output_path
             
+        # Find ffmpeg executable
+        try:
+            ffmpeg_path = find_ffmpeg_executable("ffmpeg")
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            raise
+            
         # Extract audio with ffmpeg
         cmd = [
-            "ffmpeg",
+            ffmpeg_path,
             "-i", str(media_path),
             "-ac", str(channels),  # audio channels
             "-ar", str(sample_rate),  # audio rate

@@ -294,32 +294,48 @@ class AlignmentRefiner:
             Correlation coefficient (0-1).
         """
         try:
-            # Resample TV segment to match DVD timing
-            if speed_ratio != 1.0:
-                import librosa
-                tv_resampled = librosa.resample(
-                    tv_segment.astype(np.float32),
-                    orig_sr=len(tv_segment),
-                    target_sr=int(len(tv_segment) / speed_ratio)
-                )
-            else:
-                tv_resampled = tv_segment
-                
-            # Align segments to same length
-            min_length = min(len(dvd_segment), len(tv_resampled))
+            # Align segments to same length first
+            min_length = min(len(dvd_segment), len(tv_segment))
             if min_length < 100:  # Too short for reliable correlation
                 return 0.0
-                
+            
             dvd_aligned = dvd_segment[:min_length]
-            tv_aligned = tv_resampled[:min_length]
+            tv_aligned = tv_segment[:min_length]
+            
+            # For small speed differences (< 5%), skip resampling
+            if abs(speed_ratio - 1.0) < 0.05:
+                # Use segments as-is
+                pass
+            else:
+                # Only resample for significant speed differences
+                import librosa
+                # Use a fixed sample rate for resampling (doesn't need to match actual SR)
+                # since we're just computing correlation
+                dummy_sr = 16000
+                target_length = int(len(tv_aligned) / speed_ratio)
+                
+                tv_aligned = librosa.resample(
+                    tv_aligned.astype(np.float32),
+                    orig_sr=dummy_sr,
+                    target_sr=int(dummy_sr / speed_ratio)
+                )
+                
+                # Re-align to same length after resampling
+                min_length = min(len(dvd_aligned), len(tv_aligned))
+                dvd_aligned = dvd_aligned[:min_length]
+                tv_aligned = tv_aligned[:min_length]
             
             # Compute normalized correlation
+            if np.std(dvd_aligned) < 1e-8 or np.std(tv_aligned) < 1e-8:
+                return 0.0  # Constant signal
+                
             correlation = np.corrcoef(dvd_aligned, tv_aligned)[0, 1]
             
             if np.isnan(correlation):
                 return 0.0
                 
-            return max(0.0, correlation)
+            # Return absolute correlation (similarity regardless of phase)
+            return abs(correlation)
             
         except Exception as e:
             logger.warning(f"Correlation computation failed: {e}")

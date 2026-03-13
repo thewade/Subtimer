@@ -202,23 +202,27 @@ def main(
         else:
             # Step 4: Refinement
             logger.info("Step 4: Refining alignment")
-            refiner = AlignmentRefiner(min_confidence=min_confidence)
             
-            try:
-                refined_regions = refiner.refine_regions(
-                    coarse_regions, dvd_normalized, tv_normalized, sample_rate
-                )
-                
-                alignment_map = AlignmentMap(refined_regions)
-                alignment_map.merge_compatible_regions()
-                
-                logger.info(f"Refined to {len(alignment_map.regions)} regions")
-                
-            except Exception as e:
-                logger.error(f"Refinement failed: {e}")
-                warnings.append("Refinement failed, using coarse matches")
-                alignment_map = AlignmentMap(coarse_regions)
-                
+            # TEMPORARY: Skip refiner to test raw matcher results
+            logger.info("TEMPORARY: Skipping refiner, using raw matcher results")
+            alignment_map = AlignmentMap(coarse_regions)
+            
+            # Old refiner code (commented out for testing)
+            # refiner = AlignmentRefiner(min_confidence=min_confidence)
+            # try:
+            #     refined_regions = refiner.refine_regions(
+            #         coarse_regions, dvd_normalized, tv_normalized, sample_rate
+            #     )
+            #     
+            #     alignment_map = AlignmentMap(refined_regions)
+            #     alignment_map.merge_compatible_regions()
+            #     
+            #     logger.info(f"Refined to {len(alignment_map.regions)} regions")
+            #     
+            # except Exception as e:
+            #     logger.error(f"Refinement failed: {e}")
+            #     warnings.append("Refinement failed, using coarse matches")
+            #     alignment_map = AlignmentMap(coarse_regions)
         # Step 5: Load Subtitles
         logger.info("Step 5: Loading subtitles")
         subtitle_processor = SubtitleProcessor()

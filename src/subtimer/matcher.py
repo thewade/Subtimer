@@ -23,8 +23,9 @@ class MatchConfig:
     chunk_duration: float = 30.0  # seconds per chunk
     hop_duration: float = 15.0    # hop between chunks
     min_correlation: float = 0.3   # minimum correlation threshold
-    max_speed_ratio: float = 1.1   # maximum speed difference
-    min_speed_ratio: float = 0.9   # minimum speed difference
+    max_speed_ratio: float = 1.05  # maximum speed difference (reduced)
+    min_speed_ratio: float = 0.95  # minimum speed difference (reduced)
+    max_candidates: int = 50       # limit candidates to prevent runaway processing
 
 
 @dataclass
@@ -65,11 +66,15 @@ class AudioMatcher:
         Returns:
             List of matched alignment regions.
         """
-        logger.info("Finding audio matches")
+        logger.info(f"Finding audio matches: DVD {dvd_audio.shape}, TV {tv_audio.shape}, SR {sample_rate}")
         
         # Extract features for matching
+        logger.info("Extracting DVD features...")
         dvd_features = self._extract_features(dvd_audio, sample_rate)
+        logger.info("Extracting TV features...")
         tv_features = self._extract_features(tv_audio, sample_rate)
+        
+        logger.info(f"Feature shapes: DVD {dvd_features.shape}, TV {tv_features.shape}")
         
         # Find candidate matches
         candidates = self._find_match_candidates(
@@ -143,24 +148,41 @@ class AudioMatcher:
         chunk_frames = int(self.config.chunk_duration * sample_rate / hop_length)
         hop_frames = int(self.config.hop_duration * sample_rate / hop_length)
         
+        # Reduced speed ratio testing for performance
+        speed_ratios = np.linspace(
+            self.config.min_speed_ratio, 
+            self.config.max_speed_ratio, 
+            3  # Test only 3 speed values instead of 11
+        )
+        
+        total_chunks = (dvd_features.shape[1] - chunk_frames) // hop_frames + 1
+        logger.info(f"Processing {total_chunks} DVD chunks with {len(speed_ratios)} speed ratios")
+        
+        processed = 0
+        
         # Slide DVD chunks across TV features
         for dvd_start_frame in range(0, dvd_features.shape[1] - chunk_frames, hop_frames):
+            processed += 1
+            if processed % 10 == 0:
+                logger.info(f"Processing chunk {processed}/{total_chunks}")
+                
+            # Early termination if we have enough candidates
+            if len(candidates) >= self.config.max_candidates:
+                logger.info(f"Reached max candidates limit ({self.config.max_candidates})")
+                break
+                
             dvd_end_frame = dvd_start_frame + chunk_frames
             dvd_chunk = dvd_features[:, dvd_start_frame:dvd_end_frame]
             
             # Test different speed ratios
-            for speed_ratio in np.linspace(
-                self.config.min_speed_ratio, 
-                self.config.max_speed_ratio, 
-                11  # Test 11 speed values
-            ):
+            for speed_ratio in speed_ratios:
                 scaled_chunk_frames = int(chunk_frames / speed_ratio)
                 if scaled_chunk_frames < 10:  # Skip very small chunks
                     continue
                     
                 # Find best TV match for this DVD chunk at this speed
                 best_match = self._find_best_tv_match(
-                    dvd_chunk, tv_features, scaled_chunk_frames
+                    dvd_chunk, tv_features, scaled_chunk_frames, hop_length, sample_rate
                 )
                 
                 if best_match:
@@ -181,14 +203,16 @@ class AudioMatcher:
                     )
                     candidates.append(candidate)
                     
-        logger.debug(f"Found {len(candidates)} raw candidates")
+        logger.info(f"Found {len(candidates)} raw candidates from {processed} chunks")
         return candidates
         
     def _find_best_tv_match(
         self,
         dvd_chunk: np.ndarray,
         tv_features: np.ndarray,
-        scaled_chunk_frames: int
+        scaled_chunk_frames: int,
+        hop_length: int,
+        sample_rate: int
     ) -> Optional[Tuple[int, int, float]]:
         """Find best matching TV segment for DVD chunk.
         
@@ -196,6 +220,8 @@ class AudioMatcher:
             dvd_chunk: DVD feature chunk.
             tv_features: Full TV feature matrix.
             scaled_chunk_frames: Size of TV segment to match.
+            hop_length: Hop length for frame conversion.
+            sample_rate: Audio sample rate.
             
         Returns:
             Tuple of (tv_start_frame, tv_end_frame, correlation) or None.
@@ -203,30 +229,52 @@ class AudioMatcher:
         best_correlation = 0.0
         best_match = None
         
+        # Use coarser search for performance (every 5th position instead of every 1)
+        stride = max(1, scaled_chunk_frames // 20)  # Search every ~5% of chunk size
+        
         # Slide TV window to find best correlation
-        for tv_start in range(tv_features.shape[1] - scaled_chunk_frames):
+        for tv_start in range(0, tv_features.shape[1] - scaled_chunk_frames, stride):
             tv_end = tv_start + scaled_chunk_frames
             tv_chunk = tv_features[:, tv_start:tv_end]
             
             # Resize chunks to same size for correlation
             if tv_chunk.shape[1] != dvd_chunk.shape[1]:
-                # Simple linear interpolation for resizing
+                # Use proper but efficient interpolation
                 from scipy.interpolate import interp1d
-                x_old = np.linspace(0, 1, tv_chunk.shape[1])
-                x_new = np.linspace(0, 1, dvd_chunk.shape[1])
                 
-                tv_resized = np.zeros((tv_chunk.shape[0], dvd_chunk.shape[1]))
-                for i in range(tv_chunk.shape[0]):
-                    f = interp1d(x_old, tv_chunk[i], kind='linear')
-                    tv_resized[i] = f(x_new)
-                tv_chunk = tv_resized
-                
+                # Only interpolate if size difference is significant
+                size_ratio = tv_chunk.shape[1] / dvd_chunk.shape[1]
+                if abs(size_ratio - 1.0) > 0.1:  # Only interpolate if >10% size difference
+                    x_old = np.linspace(0, 1, tv_chunk.shape[1])
+                    x_new = np.linspace(0, 1, dvd_chunk.shape[1])
+                    
+                    tv_resized = np.zeros((tv_chunk.shape[0], dvd_chunk.shape[1]))
+                    for i in range(tv_chunk.shape[0]):
+                        if np.std(tv_chunk[i]) > 1e-6:  # Skip constant channels
+                            f = interp1d(x_old, tv_chunk[i], kind='linear', bounds_error=False, fill_value='extrapolate')
+                            tv_resized[i] = f(x_new)
+                        else:
+                            tv_resized[i] = tv_chunk[i, 0]  # Constant value
+                    tv_chunk = tv_resized
+                else:
+                    # For small differences, just truncate or pad
+                    min_size = min(tv_chunk.shape[1], dvd_chunk.shape[1])
+                    if tv_chunk.shape[1] > dvd_chunk.shape[1]:
+                        tv_chunk = tv_chunk[:, :min_size]
+                        dvd_chunk = dvd_chunk[:, :min_size]
+                    else:
+                        tv_chunk = np.pad(tv_chunk, ((0, 0), (0, dvd_chunk.shape[1] - tv_chunk.shape[1])), mode='edge')
+                        
             # Compute correlation between feature vectors
             correlation = self._compute_feature_correlation(dvd_chunk, tv_chunk)
             
             if correlation > best_correlation:
                 best_correlation = correlation
                 best_match = (tv_start, tv_end, correlation)
+                
+            # Early exit if we find a very good match
+            if correlation > 0.8:
+                break
                 
         if best_correlation >= self.config.min_correlation:
             return best_match
@@ -246,22 +294,41 @@ class AudioMatcher:
         Returns:
             Correlation coefficient (0-1).
         """
+        if features1.shape != features2.shape:
+            logger.warning(f"Feature shape mismatch: {features1.shape} vs {features2.shape}")
+            return 0.0
+            
         # Flatten features and compute normalized correlation
         f1_flat = features1.flatten()
         f2_flat = features2.flatten()
         
+        # Check for constant signals
+        if np.std(f1_flat) < 1e-8 or np.std(f2_flat) < 1e-8:
+            logger.debug("Constant signal detected, returning 0 correlation")
+            return 0.0
+        
         # Normalize
-        f1_norm = (f1_flat - np.mean(f1_flat)) / (np.std(f1_flat) + 1e-8)
-        f2_norm = (f2_flat - np.mean(f2_flat)) / (np.std(f2_flat) + 1e-8)
+        f1_norm = (f1_flat - np.mean(f1_flat)) / np.std(f1_flat)
+        f2_norm = (f2_flat - np.mean(f2_flat)) / np.std(f2_flat)
         
         # Correlation coefficient
-        correlation = np.corrcoef(f1_norm, f2_norm)[0, 1]
+        corr_matrix = np.corrcoef(f1_norm, f2_norm)
+        if corr_matrix.shape == (2, 2):
+            correlation = corr_matrix[0, 1]
+        else:
+            logger.warning(f"Unexpected correlation matrix shape: {corr_matrix.shape}")
+            return 0.0
         
-        # Handle NaN (constant signals)
+        # Handle NaN (shouldn't happen now that we check for constant signals)
         if np.isnan(correlation):
+            logger.warning("NaN correlation detected")
             correlation = 0.0
-            
-        return max(0.0, correlation)  # Ensure non-negative
+        
+        # Return absolute correlation (similarity regardless of sign)
+        abs_correlation = abs(correlation)
+        logger.debug(f"Raw correlation: {correlation:.4f}, absolute: {abs_correlation:.4f}")
+        
+        return abs_correlation
         
     def _filter_candidates(self, candidates: List[MatchCandidate]) -> List[MatchCandidate]:
         """Filter and score match candidates.
