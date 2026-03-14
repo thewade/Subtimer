@@ -1,96 +1,57 @@
-"""Robust audio fingerprinting matcher.
 
-This matcher uses landmark hashing to discover *anchor correspondences* between DVD
-and TV audio, then converts those anchors into piecewise alignment regions.
+"""Robust audio matcher using full-sequence feature alignment.
 
-Unlike a simple global-offset fingerprint matcher, this implementation keeps the
-2D structure of the matches (DVD time vs TV time) so it can tolerate:
-- inserted commercials / TV-only material
-- deleted segments
-- slight speed differences / drift
-- encoding and noise differences
+This implementation treats the problem as piecewise monotonic audio alignment,
+rather than a single global offset vote.  It extracts low-rate robust features,
+runs DTW over the full episode, then converts the warping path into long matched
+regions with local linear time maps.
+
+It is designed for:
+- same episode with commercials inserted in the TV recording
+- small speed differences / drift
+- encoder / loudness differences
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import List, Tuple
 
 import librosa
 import numpy as np
-from scipy.signal import find_peaks
+from scipy.spatial.distance import cdist
 
-from .alignment_map import AlignmentRegion, RegionType
 from .matcher import MatchConfig
+from .alignment_map import AlignmentRegion, RegionType
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class AudioLandmark:
-    """A spectral landmark used for fingerprinting."""
-
-    time_frame: int
-    frequency_bin: int
-    magnitude: float
-
-
-@dataclass(frozen=True)
-class FingerprintHash:
-    """Compact hash representing a landmark pair."""
-
-    hash_value: int
-    time_offset: int
-
-
-@dataclass(frozen=True)
-class AnchorMatch:
-    """Single DVD<->TV anchor correspondence in spectrogram-frame units."""
-
-    dvd_frame: int
-    tv_frame: int
-    hash_value: int
-
-    @property
-    def time_diff(self) -> int:
-        return self.tv_frame - self.dvd_frame
+@dataclass
+class _PathPoint:
+    dvd_idx: int
+    tv_idx: int
+    cost: float
 
 
 class RobustFingerprintMatcher:
-    """Fingerprint matcher that builds piecewise alignment regions.
-
-    The matcher works in four phases:
-    1. Extract landmarks.
-    2. Generate landmark-pair hashes.
-    3. Find matching anchor pairs between DVD and TV.
-    4. Cluster anchors into monotonic, locally linear alignment regions.
-    """
+    """Piecewise audio aligner with DTW-backed segment extraction."""
 
     def __init__(self, config: MatchConfig = MatchConfig()):
         self.config = config
 
-        # Spectrogram / landmark parameters.
-        self.hop_length = 512
-        self.n_fft = 2048
-        self.frame_skip = 3
-        self.landmark_density = 4
-        self.hash_fan_value = 8
-        self.hash_time_delta = 150
+        # Feature / time resolution.  Lower rate keeps DTW tractable over full episodes.
+        self.feature_hop_seconds = 1.0
+        self.feature_window_seconds = 2.0
 
-        # Matching / clustering parameters.
-        self.max_tv_occurrences_per_hash = 50
-        self.max_total_anchor_matches = 250_000
-        self.offset_bin_frames = 12  # ~0.28 s at 44.1kHz / hop=512
-        self.offset_tolerance_frames = 18
-        self.max_anchor_gap_sec = max(20.0, self.config.chunk_duration * 0.75)
-        self.min_anchor_count = 12
-        self.min_region_duration_sec = 8.0
-        self.max_regions_from_bins = max(8, min(24, self.config.max_candidates))
-        self.max_residual_sec = 1.25
-        self.region_padding_sec = 0.35
+        # Region extraction tuning.
+        self.max_local_cost = 0.42
+        self.max_anchor_gap_seconds = 6.0
+        self.min_region_duration_seconds = 20.0
+        self.min_region_points = 12
+        self.merge_gap_seconds = 8.0
+        self.max_offset_jump_seconds = 3.0
 
     def find_matches(
         self,
@@ -98,336 +59,301 @@ class RobustFingerprintMatcher:
         tv_audio: np.ndarray,
         sample_rate: int,
     ) -> List[AlignmentRegion]:
-        """Find matched alignment regions between DVD and TV audio."""
+        """Find long matched regions between DVD and TV audio."""
         logger.info(
-            "Robust fingerprint matching: DVD %s, TV %s, SR=%s",
+            "Robust piecewise matching: DVD %s, TV %s, sr=%s",
             dvd_audio.shape,
             tv_audio.shape,
             sample_rate,
         )
 
-        logger.info("Extracting DVD landmarks...")
-        dvd_landmarks = self._extract_landmarks(dvd_audio, sample_rate)
-        logger.info("Found %d DVD landmarks", len(dvd_landmarks))
+        dvd_feat, step = self._extract_features(dvd_audio, sample_rate)
+        tv_feat, _ = self._extract_features(tv_audio, sample_rate)
 
-        logger.info("Extracting TV landmarks...")
-        tv_landmarks = self._extract_landmarks(tv_audio, sample_rate)
-        logger.info("Found %d TV landmarks", len(tv_landmarks))
-
-        if len(dvd_landmarks) < self.min_anchor_count or len(tv_landmarks) < self.min_anchor_count:
-            logger.warning("Insufficient landmarks for robust fingerprint matching")
+        if dvd_feat.shape[1] < 10 or tv_feat.shape[1] < 10:
+            logger.warning("Insufficient features for matching")
             return []
 
-        logger.info("Computing fingerprint hashes...")
-        dvd_hashes = self._generate_hashes(dvd_landmarks)
-        tv_hashes = self._generate_hashes(tv_landmarks)
         logger.info(
-            "Generated %d DVD hashes and %d TV hashes",
-            len(dvd_hashes),
-            len(tv_hashes),
+            "Feature matrices: DVD %s, TV %s, step %.3fs",
+            dvd_feat.shape,
+            tv_feat.shape,
+            step,
         )
 
-        logger.info("Finding anchor matches...")
-        anchors = self._find_anchor_matches(dvd_hashes, tv_hashes)
-        logger.info("Found %d raw anchor matches", len(anchors))
-        if len(anchors) < self.min_anchor_count:
-            logger.warning("Not enough anchor matches to build alignment regions")
+        cost = self._compute_cost_matrix(dvd_feat, tv_feat)
+        logger.info("Cost matrix shape: %s", cost.shape)
+
+        path = self._compute_warping_path(cost)
+        if not path:
+            logger.warning("No DTW path produced")
             return []
 
-        logger.info("Clustering anchor matches into piecewise regions...")
-        regions = self._anchors_to_regions(anchors, sample_rate)
-        logger.info("Robust fingerprint matcher produced %d regions", len(regions))
-        return regions
+        logger.info("Warping path points: %d", len(path))
 
-    def _extract_landmarks(self, audio: np.ndarray, sample_rate: int) -> List[AudioLandmark]:
-        """Extract strong spectral landmarks from audio."""
-        stft = librosa.stft(audio, n_fft=self.n_fft, hop_length=self.hop_length)
-        magnitude = np.abs(stft)
-        if magnitude.size == 0:
+        raw_regions = self._path_to_regions(path, step)
+        merged_regions = self._merge_regions(raw_regions)
+
+        logger.info("Produced %d matched regions", len(merged_regions))
+        return merged_regions
+
+    def _extract_features(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> Tuple[np.ndarray, float]:
+        """Extract robust low-rate features for full-sequence alignment."""
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=0)
+
+        # Normalize amplitude; avoid division by zero.
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 1e-9:
+            audio = audio / peak
+
+        hop_length = max(256, int(sample_rate * self.feature_hop_seconds))
+        win_length = max(hop_length * 2, int(sample_rate * self.feature_window_seconds))
+        n_fft = 1
+        while n_fft < win_length:
+            n_fft *= 2
+
+        # MFCC captures speech/dialogue well; chroma + contrast add robustness.
+        mfcc = librosa.feature.mfcc(
+            y=audio,
+            sr=sample_rate,
+            n_mfcc=13,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+        )
+        delta = librosa.feature.delta(mfcc)
+        rms = librosa.feature.rms(y=audio, frame_length=win_length, hop_length=hop_length)
+        contrast = librosa.feature.spectral_contrast(
+            y=audio,
+            sr=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+        )
+        zcr = librosa.feature.zero_crossing_rate(
+            y=audio,
+            frame_length=win_length,
+            hop_length=hop_length,
+        )
+
+        features = np.vstack([mfcc, delta, contrast, rms, zcr]).astype(np.float32)
+
+        # Robust per-dimension normalization.
+        mean = np.mean(features, axis=1, keepdims=True)
+        std = np.std(features, axis=1, keepdims=True)
+        std[std < 1e-6] = 1.0
+        features = (features - mean) / std
+
+        return features, hop_length / sample_rate
+
+    def _compute_cost_matrix(self, dvd_feat: np.ndarray, tv_feat: np.ndarray) -> np.ndarray:
+        """Cosine distance over frame embeddings."""
+        # cdist expects observations as rows.
+        cost = cdist(dvd_feat.T, tv_feat.T, metric="cosine").astype(np.float32)
+
+        # Clean up any NaN / inf that can come from pathological constant frames.
+        cost[~np.isfinite(cost)] = 1.0
+
+        # Small smoothing to reduce isolated bad frames.
+        if cost.shape[0] > 2 and cost.shape[1] > 2:
+            kernel = (
+                cost[:-2, :-2] + cost[:-2, 1:-1] + cost[:-2, 2:]
+                + cost[1:-1, :-2] + cost[1:-1, 1:-1] + cost[1:-1, 2:]
+                + cost[2:, :-2] + cost[2:, 1:-1] + cost[2:, 2:]
+            ) / 9.0
+            smooth = cost.copy()
+            smooth[1:-1, 1:-1] = kernel
+            cost = smooth
+
+        return cost
+
+    def _compute_warping_path(self, cost: np.ndarray) -> List[_PathPoint]:
+        """Run DTW and return forward-ordered path points."""
+        # Global constraints are intentionally disabled; commercials create large jumps.
+        _, wp = librosa.sequence.dtw(C=cost, subseq=False, backtrack=True)
+
+        if wp is None or len(wp) == 0:
             return []
 
-        magnitude_db = librosa.amplitude_to_db(magnitude, ref=np.max)
-        landmarks: List[AudioLandmark] = []
+        # librosa returns end->start; reverse to start->end.
+        path = [
+            _PathPoint(dvd_idx=int(i), tv_idx=int(j), cost=float(cost[int(i), int(j)]))
+            for i, j in reversed(wp.tolist())
+        ]
+        return path
 
-        for t_frame in range(0, magnitude_db.shape[1], self.frame_skip):
-            spectrum = magnitude_db[:, t_frame]
-            peaks, properties = find_peaks(
-                spectrum,
-                height=-45,
-                distance=15,
-                prominence=6,
+    def _path_to_regions(self, path: List[_PathPoint], step: float) -> List[AlignmentRegion]:
+        """Convert the DTW path into matched regions."""
+        if not path:
+            return []
+
+        # Keep only points that represent genuine forward progress on both axes.
+        anchors: List[_PathPoint] = []
+        prev = path[0]
+        for point in path[1:]:
+            if point.dvd_idx > prev.dvd_idx and point.tv_idx > prev.tv_idx:
+                anchors.append(point)
+            prev = point
+
+        if len(anchors) < self.min_region_points:
+            return []
+
+        # Smooth local cost over a short window.
+        costs = np.array([p.cost for p in anchors], dtype=np.float32)
+        if len(costs) >= 5:
+            kernel = np.ones(5, dtype=np.float32) / 5.0
+            smooth_costs = np.convolve(costs, kernel, mode="same")
+        else:
+            smooth_costs = costs
+
+        regions: List[AlignmentRegion] = []
+        current: List[_PathPoint] = []
+
+        max_frame_gap = max(1, int(round(self.max_anchor_gap_seconds / step)))
+
+        for idx, point in enumerate(anchors):
+            local_cost = float(smooth_costs[idx])
+
+            if not current:
+                if local_cost <= self.max_local_cost:
+                    current.append(point)
+                continue
+
+            last = current[-1]
+            dvd_gap = point.dvd_idx - last.dvd_idx
+            tv_gap = point.tv_idx - last.tv_idx
+
+            slope = tv_gap / max(dvd_gap, 1)
+            allowed_slope = (
+                self.config.min_speed_ratio * 0.9
+                <= slope
+                <= self.config.max_speed_ratio * 1.1
             )
-            if len(peaks) == 0:
-                continue
+            contiguous = dvd_gap <= max_frame_gap and tv_gap <= max_frame_gap
 
-            peak_strengths = spectrum[peaks]
-            strongest = np.argsort(peak_strengths)[-self.landmark_density :]
-            for idx in strongest:
-                strength = float(peak_strengths[idx])
-                if strength <= -40:
-                    continue
-                landmarks.append(
-                    AudioLandmark(
-                        time_frame=t_frame,
-                        frequency_bin=int(peaks[idx]),
-                        magnitude=strength,
-                    )
-                )
-
-        return landmarks
-
-    def _generate_hashes(self, landmarks: Sequence[AudioLandmark]) -> List[FingerprintHash]:
-        """Generate landmark-pair hashes."""
-        hashes: List[FingerprintHash] = []
-        landmarks_sorted = sorted(landmarks, key=lambda l: l.time_frame)
-
-        for i, anchor in enumerate(landmarks_sorted):
-            limit = min(i + self.hash_fan_value + 1, len(landmarks_sorted))
-            for j in range(i + 1, limit):
-                target = landmarks_sorted[j]
-                time_delta = target.time_frame - anchor.time_frame
-                if time_delta > self.hash_time_delta:
-                    break
-
-                hash_input = f"{anchor.frequency_bin}|{target.frequency_bin}|{time_delta}"
-                hash_value = int(hashlib.sha1(hash_input.encode()).hexdigest()[:10], 16)
-                hashes.append(FingerprintHash(hash_value=hash_value, time_offset=anchor.time_frame))
-
-        return hashes
-
-    def _find_anchor_matches(
-        self,
-        dvd_hashes: Sequence[FingerprintHash],
-        tv_hashes: Sequence[FingerprintHash],
-    ) -> List[AnchorMatch]:
-        """Find raw DVD<->TV anchor correspondences from matching hashes."""
-        tv_hash_map: DefaultDict[int, List[int]] = defaultdict(list)
-        for tv_hash in tv_hashes:
-            tv_hash_map[tv_hash.hash_value].append(tv_hash.time_offset)
-
-        anchors: List[AnchorMatch] = []
-        seen_pairs: set[Tuple[int, int]] = set()
-
-        for idx, dvd_hash in enumerate(dvd_hashes):
-            if idx % 50_000 == 0 and idx > 0:
-                logger.info("Processed %d/%d DVD hashes", idx, len(dvd_hashes))
-
-            tv_positions = tv_hash_map.get(dvd_hash.hash_value)
-            if not tv_positions:
-                continue
-            if len(tv_positions) > self.max_tv_occurrences_per_hash:
-                continue
-
-            for tv_frame in tv_positions:
-                pair = (dvd_hash.time_offset, tv_frame)
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                anchors.append(
-                    AnchorMatch(
-                        dvd_frame=dvd_hash.time_offset,
-                        tv_frame=tv_frame,
-                        hash_value=dvd_hash.hash_value,
-                    )
-                )
-                if len(anchors) >= self.max_total_anchor_matches:
-                    logger.warning(
-                        "Stopping anchor collection after %d matches",
-                        self.max_total_anchor_matches,
-                    )
-                    return anchors
-
-        return anchors
-
-    def _anchors_to_regions(
-        self,
-        anchors: Sequence[AnchorMatch],
-        sample_rate: int,
-    ) -> List[AlignmentRegion]:
-        """Cluster anchors into monotonic, piecewise linear alignment regions."""
-        if not anchors:
-            return []
-
-        # Keep the 2D structure by first grouping anchors into coarse offset bands.
-        bins: DefaultDict[int, List[AnchorMatch]] = defaultdict(list)
-        for anchor in anchors:
-            bucket = round(anchor.time_diff / self.offset_bin_frames)
-            bins[bucket].append(anchor)
-
-        candidate_regions: List[AlignmentRegion] = []
-        sorted_bins = sorted(bins.items(), key=lambda item: len(item[1]), reverse=True)
-
-        for bucket, bucket_anchors in sorted_bins[: self.max_regions_from_bins]:
-            # Pull in neighboring anchors to tolerate slight drift instead of forcing
-            # a perfectly constant offset.
-            expanded = [
-                anchor
-                for anchor in anchors
-                if abs(anchor.time_diff - bucket * self.offset_bin_frames) <= self.offset_tolerance_frames
-            ]
-            if len(expanded) < self.min_anchor_count:
-                continue
-
-            for segment in self._split_into_monotonic_segments(expanded, sample_rate):
-                region = self._fit_region(segment, sample_rate)
-                if region is None:
-                    continue
-                if region.confidence < self.config.min_correlation:
-                    continue
-                candidate_regions.append(region)
-
-        return self._deduplicate_regions(candidate_regions)
-
-    def _split_into_monotonic_segments(
-        self,
-        anchors: Sequence[AnchorMatch],
-        sample_rate: int,
-    ) -> List[List[AnchorMatch]]:
-        """Split anchors into locally monotonic segments.
-
-        Commercial breaks and other edits usually appear as jumps in the DVD-vs-TV time
-        plane. This step preserves local runs of supporting anchors instead of collapsing
-        everything into one global offset.
-        """
-        if not anchors:
-            return []
-
-        max_gap_frames = int(self.max_anchor_gap_sec * sample_rate / self.hop_length)
-        sorted_anchors = sorted(anchors, key=lambda a: (a.dvd_frame, a.tv_frame))
-
-        segments: List[List[AnchorMatch]] = []
-        current: List[AnchorMatch] = [sorted_anchors[0]]
-        last = sorted_anchors[0]
-
-        for anchor in sorted_anchors[1:]:
-            dvd_gap = anchor.dvd_frame - last.dvd_frame
-            tv_gap = anchor.tv_frame - last.tv_frame
-            diff_jump = abs(anchor.time_diff - last.time_diff)
-
-            monotonic = anchor.dvd_frame > last.dvd_frame and anchor.tv_frame > last.tv_frame
-            locally_consistent = diff_jump <= self.offset_tolerance_frames * 2
-
-            if monotonic and dvd_gap <= max_gap_frames and tv_gap <= max_gap_frames and locally_consistent:
-                current.append(anchor)
+            if local_cost <= self.max_local_cost and contiguous and allowed_slope:
+                current.append(point)
             else:
-                if len(current) >= self.min_anchor_count:
-                    segments.append(current)
-                current = [anchor]
-            last = anchor
+                region = self._fit_region(current, step, smooth_costs, anchors)
+                if region is not None:
+                    regions.append(region)
+                current = [point] if local_cost <= self.max_local_cost else []
 
-        if len(current) >= self.min_anchor_count:
-            segments.append(current)
+        region = self._fit_region(current, step, smooth_costs, anchors)
+        if region is not None:
+            regions.append(region)
 
-        return segments
+        return regions
 
     def _fit_region(
         self,
-        anchors: Sequence[AnchorMatch],
-        sample_rate: int,
-    ) -> Optional[AlignmentRegion]:
-        """Fit a local linear mapping to a segment of anchors."""
-        if len(anchors) < self.min_anchor_count:
+        points: List[_PathPoint],
+        step: float,
+        all_costs: np.ndarray,
+        all_points: List[_PathPoint],
+    ) -> AlignmentRegion | None:
+        """Fit a local linear map tv = a*dvd + b for one region."""
+        if len(points) < self.min_region_points:
             return None
 
-        dvd_frames = np.array([a.dvd_frame for a in anchors], dtype=np.float64)
-        tv_frames = np.array([a.tv_frame for a in anchors], dtype=np.float64)
+        dvd_times = np.array([p.dvd_idx * step for p in points], dtype=np.float64)
+        tv_times = np.array([p.tv_idx * step for p in points], dtype=np.float64)
 
-        if np.unique(dvd_frames).size < 3:
+        duration = dvd_times[-1] - dvd_times[0]
+        if duration < self.min_region_duration_seconds:
             return None
 
-        # Fit tv_frame ~= a * dvd_frame + b.
-        A = np.column_stack([dvd_frames, np.ones_like(dvd_frames)])
-        try:
-            slope, intercept = np.linalg.lstsq(A, tv_frames, rcond=None)[0]
-        except np.linalg.LinAlgError:
+        # First-pass fit.
+        a, b = np.polyfit(dvd_times, tv_times, 1)
+        predicted = a * dvd_times + b
+        residuals = tv_times - predicted
+
+        # Robust inlier pass.
+        mad = np.median(np.abs(residuals - np.median(residuals)))
+        tol = max(1.0, 3.5 * 1.4826 * mad)
+        inliers = np.abs(residuals) <= tol
+
+        if np.count_nonzero(inliers) < self.min_region_points:
             return None
 
-        if slope <= 0:
+        dvd_in = dvd_times[inliers]
+        tv_in = tv_times[inliers]
+
+        duration_in = dvd_in[-1] - dvd_in[0]
+        if duration_in < self.min_region_duration_seconds:
             return None
 
-        residuals = np.abs(tv_frames - (slope * dvd_frames + intercept))
-        max_residual_frames = self.max_residual_sec * sample_rate / self.hop_length
-        inlier_mask = residuals <= max_residual_frames
-
-        if int(np.sum(inlier_mask)) < self.min_anchor_count:
+        a, b = np.polyfit(dvd_in, tv_in, 1)
+        if not (self.config.min_speed_ratio * 0.9 <= a <= self.config.max_speed_ratio * 1.1):
             return None
 
-        dvd_inliers = dvd_frames[inlier_mask]
-        tv_inliers = tv_frames[inlier_mask]
+        predicted = a * dvd_in + b
+        residuals = tv_in - predicted
+        rms_err = float(np.sqrt(np.mean(residuals ** 2))) if residuals.size else 999.0
 
-        # Refit using only inliers.
-        A_inliers = np.column_stack([dvd_inliers, np.ones_like(dvd_inliers)])
-        try:
-            slope, intercept = np.linalg.lstsq(A_inliers, tv_inliers, rcond=None)[0]
-        except np.linalg.LinAlgError:
+        # Confidence combines path quality, fit quality, and coverage.
+        raw_costs = np.array([p.cost for p in points], dtype=np.float32)
+        mean_cost = float(np.mean(raw_costs))
+        cost_score = float(np.clip(1.0 - mean_cost / max(self.max_local_cost, 1e-6), 0.0, 1.0))
+        fit_score = float(np.clip(1.0 - rms_err / 2.5, 0.0, 1.0))
+        coverage_score = float(np.clip(duration_in / 180.0, 0.0, 1.0))
+        confidence = 0.5 * cost_score + 0.35 * fit_score + 0.15 * coverage_score
+
+        if confidence < max(0.20, self.config.min_correlation * 0.8):
             return None
 
-        if slope <= 0:
+        dvd_start = float(dvd_in[0])
+        dvd_end = float(dvd_in[-1] + step)
+        tv_start = float(tv_in[0])
+        tv_end = float(tv_in[-1] + step)
+
+        if dvd_end <= dvd_start or tv_end <= tv_start:
             return None
-        if not (self.config.min_speed_ratio <= slope <= self.config.max_speed_ratio):
-            return None
-
-        residuals = np.abs(tv_inliers - (slope * dvd_inliers + intercept))
-        residual_sec = float(np.median(residuals) * self.hop_length / sample_rate)
-
-        dvd_start = float(np.min(dvd_inliers) * self.hop_length / sample_rate) - self.region_padding_sec
-        dvd_end = float(np.max(dvd_inliers) * self.hop_length / sample_rate) + self.region_padding_sec
-        tv_start = float(np.min(tv_inliers) * self.hop_length / sample_rate) - self.region_padding_sec
-        tv_end = float(np.max(tv_inliers) * self.hop_length / sample_rate) + self.region_padding_sec
-
-        dvd_start = max(0.0, dvd_start)
-        tv_start = max(0.0, tv_start)
-
-        if dvd_end - dvd_start < self.min_region_duration_sec:
-            return None
-        if tv_end - tv_start < self.min_region_duration_sec:
-            return None
-
-        anchor_count = int(dvd_inliers.size)
-        density_score = min(1.0, anchor_count / 60.0)
-        residual_score = max(0.0, 1.0 - (residual_sec / self.max_residual_sec))
-        span_score = min(1.0, (dvd_end - dvd_start) / max(self.config.chunk_duration, 1.0))
-        confidence = float(0.45 * density_score + 0.4 * residual_score + 0.15 * span_score)
-
-        offset_seconds = float(intercept * self.hop_length / sample_rate)
-        region_type = RegionType.MATCHED if confidence >= max(self.config.min_correlation, 0.5) else RegionType.LOW_CONFIDENCE
 
         return AlignmentRegion(
             dvd_start=dvd_start,
             dvd_end=dvd_end,
             tv_start=tv_start,
             tv_end=tv_end,
-            offset_seconds=offset_seconds,
-            speed_ratio=float(slope),
-            confidence=min(1.0, max(0.0, confidence)),
-            region_type=region_type,
+            offset_seconds=float(b),
+            speed_ratio=float(a),
+            confidence=float(min(0.99, confidence)),
+            region_type=RegionType.MATCHED,
         )
 
-    def _deduplicate_regions(self, regions: Sequence[AlignmentRegion]) -> List[AlignmentRegion]:
-        """Remove heavily overlapping duplicate regions, keeping the strongest ones."""
+    def _merge_regions(self, regions: List[AlignmentRegion]) -> List[AlignmentRegion]:
+        """Merge adjacent regions with compatible local transforms."""
         if not regions:
             return []
 
-        sorted_regions = sorted(
-            regions,
-            key=lambda r: (r.confidence, r.dvd_duration, r.tv_duration),
-            reverse=True,
-        )
-        kept: List[AlignmentRegion] = []
-        for region in sorted_regions:
-            if any(self._regions_overlap(region, other) for other in kept):
-                continue
-            kept.append(region)
+        regions = sorted(regions, key=lambda r: r.dvd_start)
+        merged: List[AlignmentRegion] = [regions[0]]
 
-        kept.sort(key=lambda r: r.dvd_start)
-        return kept
+        for region in regions[1:]:
+            prev = merged[-1]
 
-    @staticmethod
-    def _regions_overlap(region1: AlignmentRegion, region2: AlignmentRegion) -> bool:
-        """Return True when two regions substantially overlap on either timeline."""
-        dvd_overlap = min(region1.dvd_end, region2.dvd_end) - max(region1.dvd_start, region2.dvd_start)
-        tv_overlap = min(region1.tv_end, region2.tv_end) - max(region1.tv_start, region2.tv_start)
+            dvd_gap = region.dvd_start - prev.dvd_end
+            tv_gap = region.tv_start - prev.tv_end
+            speed_close = abs(region.speed_ratio - prev.speed_ratio) <= 0.02
+            offset_close = abs(region.offset_seconds - prev.offset_seconds) <= self.max_offset_jump_seconds
+            gaps_small = dvd_gap <= self.merge_gap_seconds and tv_gap <= self.merge_gap_seconds
 
-        dvd_ratio = dvd_overlap / max(min(region1.dvd_duration, region2.dvd_duration), 1e-6)
-        tv_ratio = tv_overlap / max(min(region1.tv_duration, region2.tv_duration), 1e-6)
-        return dvd_ratio > 0.5 or tv_ratio > 0.5
+            if speed_close and offset_close and gaps_small:
+                merged[-1] = AlignmentRegion(
+                    dvd_start=prev.dvd_start,
+                    dvd_end=max(prev.dvd_end, region.dvd_end),
+                    tv_start=prev.tv_start,
+                    tv_end=max(prev.tv_end, region.tv_end),
+                    offset_seconds=(prev.offset_seconds + region.offset_seconds) / 2.0,
+                    speed_ratio=(prev.speed_ratio + region.speed_ratio) / 2.0,
+                    confidence=max(prev.confidence, region.confidence),
+                    region_type=RegionType.MATCHED,
+                )
+            else:
+                merged.append(region)
+
+        return merged
