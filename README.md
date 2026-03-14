@@ -12,7 +12,12 @@ The tool analyzes the audio from both sources to create a piecewise time mapping
 
 ## Features
 
+- **Multiple matching algorithms**: 
+  - Basic MFCC correlation
+  - Hint-guided matching for known content
+  - Robust fingerprinting for challenging cases
 - **Audio-based alignment**: Uses robust audio fingerprinting to match DVD and TV content
+- **Timing hints support**: Optional YAML hints file for improved accuracy on known content
 - **Handles complex timing differences**: 
   - Commercial insertions
   - Speed differences (PAL speedup, etc.)
@@ -53,6 +58,11 @@ pip install -e .[dev]  # Include development dependencies
 subtimer dvd_file.mkv tv_file.mkv subtitles.srt
 ```
 
+### With hints file for improved accuracy
+```bash
+subtimer dvd_file.mkv tv_file.mkv subtitles.srt --hints hints.yaml
+```
+
 ### With custom output location
 ```bash
 subtimer dvd_file.mkv tv_file.mkv subtitles.srt -o output_directory/
@@ -62,6 +72,8 @@ subtimer dvd_file.mkv tv_file.mkv subtitles.srt -o output_directory/
 ```bash
 subtimer dvd_file.mkv tv_file.mkv subtitles.srt \
   --output-srt retimed_subtitles.srt \
+  --hints timing_hints.yaml \
+  --matcher robust \
   --sample-rate 22050 \
   --chunk-duration 30.0 \
   --min-correlation 0.3 \
@@ -81,6 +93,33 @@ Supports any format that FFmpeg can decode:
 ### Subtitles  
 - SRT format only (initial version)
 - UTF-8 encoding recommended
+
+### Hints File (Optional)
+The tool can use a YAML hints file for improved accuracy on known content:
+
+```yaml
+episode_id: example_s09e01
+
+dvd_events:
+  - { label: intro_start, time: "00:00:00" }
+  - { label: act_1_start, time: "00:00:25" }
+  - { label: act_2_start, time: "00:07:07" }
+  - { label: act_3_start, time: "00:15:15" }
+  - { label: credits_start, time: "00:21:55" }
+
+tv_events:
+  - { label: intro_start, time: "00:00:05" }
+  - { label: act_1_start, time: "00:00:27" }
+  - { label: commercial_1_start, time: "00:06:52" }
+  - { label: act_2_start, time: "00:10:57" }
+  - { label: commercial_2_start, time: "00:19:03" }
+  - { label: act_3_start, time: "00:19:37" }
+  - { label: credits_start, time: "00:29:54" }
+```
+
+- Auto-detects `hints.yaml` in subtitle file directory
+- Use `--hints path/to/hints.yaml` for custom location
+- Greatly improves accuracy and performance for known content
 
 ## Output Files
 
@@ -115,6 +154,8 @@ The tool generates three output files:
 - `--cache/--no-cache`: Enable/disable audio caching (default: enabled)
 
 ### Matching Parameters
+- `--matcher`: Audio matching algorithm: `basic`, `hints`, `robust` (default: hints)
+- `--hints`: Path to timing hints YAML file for guided matching
 - `--chunk-duration`: Chunk size for matching in seconds (default: 30.0)
 - `--min-correlation`: Minimum correlation threshold (default: 0.3)
 - `--min-confidence`: Minimum confidence for retiming (default: 0.4)

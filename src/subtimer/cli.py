@@ -59,6 +59,8 @@ logger = logging.getLogger(__name__)
               help='Split subtitles at region boundaries')
 @click.option('--matcher', type=click.Choice(['basic', 'hints', 'robust'], case_sensitive=False), 
               default='hints', help='Audio matching algorithm to use')
+@click.option('--hints', type=click.Path(exists=True, path_type=Path), 
+              help='Path to hints YAML file (optional, auto-detects hints.yaml in subtitle dir if not provided)')
 @click.option('--verbose', '-v', is_flag=True,
               help='Enable verbose logging')
 @click.option('--debug', is_flag=True,
@@ -81,6 +83,7 @@ def main(
     flag_boundaries: bool,
     split_boundaries: bool,
     matcher: str,
+    hints: Optional[Path],
     verbose: bool,
     debug: bool
 ) -> None:
@@ -127,14 +130,19 @@ def main(
         
         warnings = []
         
-        # Check for hints file
-        hints_path = Path(subtitle_file).parent / 'hints.yaml'
-        hints = load_hints_file(hints_path) if hints_path.exists() else None
-        
+        # Load hints file - from parameter or auto-detect
+        hints_obj = None
         if hints:
-            logger.info(f"Loaded timing hints for {hints.episode_id}")
+            hints_obj = load_hints_file(hints)
+            logger.info(f"Loaded timing hints from {hints} for {hints_obj.episode_id}")
         else:
-            logger.info("No hints file found, using automatic detection only")
+            # Auto-detect hints.yaml in subtitle directory
+            auto_hints_path = Path(subtitle_file).parent / 'hints.yaml'
+            if auto_hints_path.exists():
+                hints_obj = load_hints_file(auto_hints_path)
+                logger.info(f"Auto-detected timing hints from {auto_hints_path} for {hints_obj.episode_id}")
+            else:
+                logger.info("No hints file found, using automatic detection only")
         
         # Step 1: Media I/O and Audio Extraction
         logger.info("Step 1: Processing media files")
@@ -192,10 +200,10 @@ def main(
         if matcher == 'robust':
             matcher_obj = RobustFingerprintMatcher(config=match_config)
             logger.info("Using robust fingerprint matching")
-        elif matcher == 'hints' and hints:
-            matcher_obj = HintGuidedMatcher(config=match_config, hints=hints)
+        elif matcher == 'hints' and hints_obj:
+            matcher_obj = HintGuidedMatcher(config=match_config, hints=hints_obj)
             logger.info("Using hint-guided matching")
-        elif matcher == 'hints' and not hints:
+        elif matcher == 'hints' and not hints_obj:
             logger.warning("Hints matcher requested but no hints file found, falling back to basic matcher")
             matcher_obj = AudioMatcher(config=match_config)
             logger.info("Using standard audio matching")
@@ -237,9 +245,9 @@ def main(
             alignment_map = AlignmentMap(coarse_regions)
             
             # Validate against hints if available
-            if hints:
+            if hints_obj:
                 hint_warnings = validate_alignment_against_hints(
-                    alignment_map.regions, hints, tolerance_seconds=5.0
+                    alignment_map.regions, hints_obj, tolerance_seconds=5.0
                 )
                 if hint_warnings:
                     logger.warning(f"Hint validation found {len(hint_warnings)} issues")

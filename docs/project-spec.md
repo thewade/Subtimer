@@ -18,8 +18,9 @@ The tool must produce a **piecewise time map** between DVD and TV audio, then us
 
 A Python command-line tool that takes:
 - a DVD media file or extracted DVD audio
-- a TV media file or extracted TV audio
+- a TV media file or extracted TV audio  
 - a TV-timed `.srt`
+- (optional) a timing hints YAML file
 
 and outputs:
 - a DVD-timed `.srt`
@@ -35,11 +36,31 @@ Support these inputs:
 - DVD media file or extracted audio
 - TV media file or extracted audio
 - TV subtitle file in `.srt`
+- (optional) timing hints file in YAML format
 
 Initial formats:
 - media: anything FFmpeg can decode
 - working audio: mono WAV
 - subtitles: SRT only
+- hints: YAML with episode timing markers
+
+The hints file format should include:
+```yaml
+episode_id: "show_season_episode"
+
+dvd_events:
+  - { label: intro_start, time: "00:00:00" }
+  - { label: act_1_start, time: "00:00:25" }
+  # ... additional DVD timing markers
+
+tv_events:
+  - { label: intro_start, time: "00:00:05" }
+  - { label: act_1_start, time: "00:00:27" }
+  - { label: commercial_1_start, time: "00:06:52" }
+  # ... additional TV timing markers including commercials
+```
+
+The tool should auto-detect `hints.yaml` in the subtitle directory or accept an explicit `--hints` path.
 
 ### 2. Audio Preparation
 The tool must:
@@ -62,11 +83,10 @@ It must support:
 It must **not** assume a single global offset.
 
 ### 4. Matching Strategy
-Implementation may use:
-- fingerprint-based matching
-- feature-based matching
-- DTW-based refinement
-- a hybrid approach
+Implementation supports multiple matching approaches:
+- **Basic**: MFCC correlation for clean audio
+- **Hints**: Hint-guided matching for known content with timing markers
+- **Robust**: Spectral fingerprinting for challenging cases with encoding differences
 
 Requirements for the strategy:
 - tolerate encoding differences and noise
@@ -74,6 +94,9 @@ Requirements for the strategy:
 - tolerate moderate speed changes
 - produce ordered matched regions
 - refine boundaries beyond crude fixed chunk edges
+
+The hints-based approach should leverage timing markers to focus matching on likely regions,
+significantly improving performance and accuracy for known content.
 
 ### 5. Time Map
 Represent alignment as ordered regions.
