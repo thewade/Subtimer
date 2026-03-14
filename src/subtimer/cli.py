@@ -12,6 +12,7 @@ from . import __version__
 from .media_io import MediaProcessor 
 from .audio_prep import AudioPreprocessor, AudioConfig
 from .matcher import AudioMatcher, MatchConfig
+from .robust_matcher import RobustFingerprintMatcher
 from .hint_guided_matcher import HintGuidedMatcher 
 from .refiner import AlignmentRefiner
 from .alignment_map import AlignmentMap
@@ -56,6 +57,8 @@ logger = logging.getLogger(__name__)
               help='Flag subtitles crossing region boundaries')
 @click.option('--split-boundaries/--no-split-boundaries', default=False,
               help='Split subtitles at region boundaries')
+@click.option('--matcher', type=click.Choice(['basic', 'hints', 'robust'], case_sensitive=False), 
+              default='hints', help='Audio matching algorithm to use')
 @click.option('--verbose', '-v', is_flag=True,
               help='Enable verbose logging')
 @click.option('--debug', is_flag=True,
@@ -77,6 +80,7 @@ def main(
     drop_unmatched: bool,
     flag_boundaries: bool,
     split_boundaries: bool,
+    matcher: str,
     verbose: bool,
     debug: bool
 ) -> None:
@@ -184,12 +188,19 @@ def main(
             min_correlation=min_correlation
         )
         
-        # Use hint-guided matcher if hints are available
-        if hints:
-            matcher = HintGuidedMatcher(config=match_config, hints=hints)
+        # Select matcher based on user preference
+        if matcher == 'robust':
+            matcher_obj = RobustFingerprintMatcher(config=match_config)
+            logger.info("Using robust fingerprint matching")
+        elif matcher == 'hints' and hints:
+            matcher_obj = HintGuidedMatcher(config=match_config, hints=hints)
             logger.info("Using hint-guided matching")
-        else:
-            matcher = AudioMatcher(config=match_config)
+        elif matcher == 'hints' and not hints:
+            logger.warning("Hints matcher requested but no hints file found, falling back to basic matcher")
+            matcher_obj = AudioMatcher(config=match_config)
+            logger.info("Using standard audio matching")
+        else:  # matcher == 'basic' or fallback
+            matcher_obj = AudioMatcher(config=match_config)
             logger.info("Using standard audio matching")
         
         try:
@@ -202,7 +213,7 @@ def main(
                 (dvd_audio_data, dvd_sr), (tv_audio_data, tv_sr)
             )
             
-            coarse_regions = matcher.find_matches(
+            coarse_regions = matcher_obj.find_matches(
                 dvd_normalized, tv_normalized, sample_rate
             )
             
