@@ -48,17 +48,21 @@ class RobustFingerprintMatcher:
 
         # Region extraction tuning.
         self.max_local_cost = 0.50
-        self.max_anchor_gap_seconds = 12.0
-        self.max_balanced_gap_seconds = 25.0
-        self.min_region_duration_seconds = 20.0
-        self.min_region_points = 18
-        self.max_short_bad_run = 4
+        self.max_anchor_gap_seconds = 20.0  # More tolerant of gaps
+        self.max_balanced_gap_seconds = 40.0  # Allow larger gaps within acts
+        self.min_region_duration_seconds = 15.0  # Slightly lower minimum
+        self.min_region_points = 12  # More forgiving
+        self.max_short_bad_run = 8  # Tolerate longer noisy runs
+        self.bad_cost_tolerance = 0.65  # Accept slightly worse costs in bad runs
+        self.edge_deemphasis_seconds = 30.0  # De-emphasize episode edges
 
-        # Region merge tuning.
-        self.merge_gap_seconds = 75.0
-        self.max_offset_jump_seconds = 2.5
-        self.max_gap_mismatch_seconds = 4.5
-        self.max_edge_prediction_error_seconds = 3.5
+        # Region merge tuning - more aggressive merging.
+        self.merge_gap_seconds = 120.0  # Allow much larger merge gaps
+        self.max_offset_jump_seconds = 5.0  # More tolerant of offset differences
+        self.max_gap_mismatch_seconds = 8.0  # More tolerant of gap mismatches
+        self.max_edge_prediction_error_seconds = 6.0  # More tolerant of prediction errors
+        self.merge_speed_tolerance = 0.05  # Allow more speed difference
+        self.prefer_long_spans_bonus = 0.15  # Bonus for longer regions in scoring
 
     def find_matches(
         self,
@@ -204,32 +208,42 @@ class RobustFingerprintMatcher:
         regions: List[AlignmentRegion] = []
         current: List[_PathPoint] = []
         bad_run = 0
-
+        total_duration = len(anchors) * step if anchors else 0.0
+        
         for idx, point in enumerate(anchors):
             local_cost = float(smooth_costs[idx])
+            point_time = point.dvd_idx * step
+            
+            # De-emphasize points near episode edges
+            is_near_edge = (point_time < self.edge_deemphasis_seconds or 
+                           point_time > total_duration - self.edge_deemphasis_seconds)
+            edge_cost_bonus = 0.1 if is_near_edge else 0.0
+            adjusted_cost = local_cost + edge_cost_bonus
+            
             if not current:
-                if local_cost <= self.max_local_cost:
+                if adjusted_cost <= self.max_local_cost:
                     current.append(point)
                 continue
 
             can_extend = self._point_can_extend_region(
                 current=current,
                 point=point,
-                local_cost=local_cost,
+                local_cost=adjusted_cost,
                 step=step,
             )
 
             if can_extend:
                 current.append(point)
-                if local_cost <= self.max_local_cost:
+                if adjusted_cost <= self.max_local_cost:
                     bad_run = 0
                 else:
                     bad_run += 1
                 continue
 
-            # Tolerate short noisy runs before splitting.
+            # Much more tolerant of noisy runs - prefer continuity over purity.
+            # Allow bridging through moderate cost spikes if geometry is reasonable.
             if (
-                local_cost <= self.max_local_cost * 1.15
+                adjusted_cost <= self.bad_cost_tolerance
                 and bad_run < self.max_short_bad_run
                 and self._point_has_reasonable_geometry(current[-1], point, step)
             ):
@@ -237,11 +251,23 @@ class RobustFingerprintMatcher:
                 bad_run += 1
                 continue
 
+            # Even if cost is high, continue if we have strong geometric consistency
+            # and this would extend a long region.
+            if (
+                len(current) >= 20  # Already have substantial region
+                and bad_run < self.max_short_bad_run // 2
+                and self._point_fits_strong_geometry(current, point, step)
+            ):
+                current.append(point)
+                bad_run += 1
+                continue
+
+            # Finalize current region and start fresh.
             region = self._fit_region(current, step)
             if region is not None:
                 regions.append(region)
 
-            current = [point] if local_cost <= self.max_local_cost else []
+            current = [point] if adjusted_cost <= self.max_local_cost else []
             bad_run = 0
 
         region = self._fit_region(current, step)
@@ -279,6 +305,48 @@ class RobustFingerprintMatcher:
 
         return True
 
+    def _point_fits_strong_geometry(
+        self,
+        current: List[_PathPoint],
+        point: _PathPoint,
+        step: float,
+    ) -> bool:
+        """Check if point fits strong geometric consistency even with high cost."""
+        if len(current) < 8:
+            return False
+            
+        # Use recent points to establish local trend
+        recent = current[-8:]
+        dvd_times = [p.dvd_idx * step for p in recent]
+        tv_times = [p.tv_idx * step for p in recent]
+        
+        try:
+            # Fit local trend
+            slope, intercept = np.polyfit(dvd_times, tv_times, 1)
+            
+            # Predict where this point should be
+            predicted_tv = slope * (point.dvd_idx * step) + intercept
+            actual_tv = point.tv_idx * step
+            
+            # Check if geometric consistency is very strong
+            prediction_error = abs(actual_tv - predicted_tv)
+            
+            # Also check if the step from last point is reasonable
+            last = current[-1]
+            dvd_step = (point.dvd_idx - last.dvd_idx) * step
+            tv_step = (point.tv_idx - last.tv_idx) * step
+            
+            if dvd_step <= 0 or tv_step <= 0:
+                return False
+                
+            step_slope = tv_step / dvd_step
+            
+            return (prediction_error <= 2.0 and  # Very tight geometric fit
+                   abs(step_slope - slope) <= 0.03 and  # Consistent local slope
+                   0.8 <= step_slope <= 1.25)  # Reasonable range
+        except:
+            return False
+
     def _point_can_extend_region(
         self,
         current: List[_PathPoint],
@@ -297,26 +365,33 @@ class RobustFingerprintMatcher:
             return False
 
         slope = tv_gap / max(dvd_gap, 1e-6)
-        if not (self.config.min_speed_ratio * 0.85 <= slope <= self.config.max_speed_ratio * 1.15):
+        if not (self.config.min_speed_ratio * 0.8 <= slope <= self.config.max_speed_ratio * 1.2):
             return False
 
-        # Avoid bridging commercial jumps inside a matched region.
+        # More tolerant of gap mismatches - might be within-act variation.
         if abs(tv_gap - dvd_gap) > self.max_gap_mismatch_seconds:
             return False
 
         if local_cost <= self.max_local_cost:
             return True
 
-        # If the cost is slightly worse, still accept it when it matches the
-        # current local affine model reasonably well.
-        if len(current) < max(self.min_region_points // 2, 8):
+        # More aggressive model-based extension for longer regions.
+        if len(current) < 6:
             return False
 
         pred_tv, err = self._predict_tv_time(current, point.dvd_idx * step, step)
         if pred_tv is None:
             return False
 
-        return abs((point.tv_idx * step) - pred_tv) <= self.max_edge_prediction_error_seconds and err <= 2.5
+        # More tolerant of prediction errors, especially for longer regions.
+        error_tolerance = self.max_edge_prediction_error_seconds
+        if len(current) >= 15:
+            error_tolerance *= 1.5  # More tolerance for established regions
+            
+        fit_tolerance = 3.5 if len(current) >= 12 else 2.0
+        
+        return (abs((point.tv_idx * step) - pred_tv) <= error_tolerance and 
+                err <= fit_tolerance)
 
     def _predict_tv_time(
         self,
@@ -393,7 +468,12 @@ class RobustFingerprintMatcher:
         fit_score = float(np.clip(1.0 - rms_err / 3.0, 0.0, 1.0))
         coverage_score = float(np.clip(duration_in / 240.0, 0.0, 1.0))
         inlier_score = float(np.clip(np.count_nonzero(inliers) / max(len(points), 1), 0.0, 1.0))
-        confidence = 0.40 * cost_score + 0.25 * fit_score + 0.20 * coverage_score + 0.15 * inlier_score
+        
+        # Add bonus for long spans to prefer continuity over fragmentation
+        length_bonus = min(self.prefer_long_spans_bonus, duration_in / 300.0 * self.prefer_long_spans_bonus)
+        
+        confidence = (0.35 * cost_score + 0.20 * fit_score + 0.25 * coverage_score + 
+                     0.10 * inlier_score + 0.10 * length_bonus)
         if confidence < max(0.18, self.config.min_correlation * 0.75):
             return None
 
@@ -421,55 +501,114 @@ class RobustFingerprintMatcher:
             return []
 
         regions = sorted(regions, key=lambda r: r.dvd_start)
+        
+        # Multi-pass merging: first pass is conservative, second is more aggressive
+        merged = self._merge_regions_pass(regions, conservative=True)
+        merged = self._merge_regions_pass(merged, conservative=False)
+        
+        return merged
+    
+    def _merge_regions_pass(self, regions: List[AlignmentRegion], conservative: bool) -> List[AlignmentRegion]:
+        """Single pass of region merging."""
+        if not regions:
+            return []
+            
         merged: List[AlignmentRegion] = [regions[0]]
         for region in regions[1:]:
             prev = merged[-1]
-            if self._regions_are_mergeable(prev, region):
+            if self._regions_are_mergeable(prev, region, conservative):
+                # Weight parameters by region duration for better blending
+                prev_duration = prev.dvd_end - prev.dvd_start
+                curr_duration = region.dvd_end - region.dvd_start
+                total_duration = prev_duration + curr_duration
+                
+                prev_weight = prev_duration / total_duration if total_duration > 0 else 0.5
+                curr_weight = curr_duration / total_duration if total_duration > 0 else 0.5
+                
+                merged_offset = (prev.offset_seconds * prev_weight + 
+                               region.offset_seconds * curr_weight)
+                merged_speed = (prev.speed_ratio * prev_weight + 
+                              region.speed_ratio * curr_weight)
+                
+                # Boost confidence for merged longer regions
+                base_confidence = max(prev.confidence, region.confidence)
+                total_duration = prev_duration + curr_duration
+                
+                # Significant boost for longer merged regions
+                if total_duration > 60.0:  # More than 1 minute
+                    duration_bonus = min(0.25, total_duration / 240.0 * 0.25)
+                    merged_confidence = min(0.99, base_confidence + duration_bonus)
+                else:
+                    merged_confidence = base_confidence
+                
                 merged[-1] = AlignmentRegion(
                     dvd_start=prev.dvd_start,
                     dvd_end=max(prev.dvd_end, region.dvd_end),
                     tv_start=prev.tv_start,
                     tv_end=max(prev.tv_end, region.tv_end),
-                    offset_seconds=(prev.offset_seconds + region.offset_seconds) / 2.0,
-                    speed_ratio=(prev.speed_ratio + region.speed_ratio) / 2.0,
-                    confidence=max(prev.confidence, region.confidence),
+                    offset_seconds=merged_offset,
+                    speed_ratio=merged_speed,
+                    confidence=merged_confidence,
                     region_type=RegionType.MATCHED,
                 )
             else:
                 merged.append(region)
         return merged
 
-    def _regions_are_mergeable(self, prev: AlignmentRegion, region: AlignmentRegion) -> bool:
+    def _regions_are_mergeable(self, prev: AlignmentRegion, region: AlignmentRegion, conservative: bool = True) -> bool:
         """Check whether two adjacent regions likely belong to one act."""
         dvd_gap = region.dvd_start - prev.dvd_end
         tv_gap = region.tv_start - prev.tv_end
 
-        if dvd_gap < -2.0 or tv_gap < -2.0:
+        # Allow small overlaps
+        if dvd_gap < -5.0 or tv_gap < -5.0:
             return False
-        if dvd_gap > self.merge_gap_seconds or tv_gap > self.merge_gap_seconds:
+            
+        # More generous gap tolerance, especially in second pass
+        gap_limit = self.merge_gap_seconds if conservative else self.merge_gap_seconds * 1.8
+        if dvd_gap > gap_limit or tv_gap > gap_limit:
             return False
 
-        speed_close = abs(region.speed_ratio - prev.speed_ratio) <= 0.02
-        offset_close = abs(region.offset_seconds - prev.offset_seconds) <= self.max_offset_jump_seconds
+        # More tolerant speed and offset criteria
+        speed_tolerance = self.merge_speed_tolerance if conservative else self.merge_speed_tolerance * 2.0
+        offset_tolerance = self.max_offset_jump_seconds if conservative else self.max_offset_jump_seconds * 1.5
+        
+        speed_close = abs(region.speed_ratio - prev.speed_ratio) <= speed_tolerance
+        offset_close = abs(region.offset_seconds - prev.offset_seconds) <= offset_tolerance
+        
+        # In non-conservative mode, be more flexible if one criterion is very good
+        if not conservative:
+            very_close_speed = abs(region.speed_ratio - prev.speed_ratio) <= 0.01
+            very_close_offset = abs(region.offset_seconds - prev.offset_seconds) <= 1.0
+            if very_close_speed or very_close_offset:
+                speed_close = abs(region.speed_ratio - prev.speed_ratio) <= 0.08
+                offset_close = abs(region.offset_seconds - prev.offset_seconds) <= 8.0
+        
         if not (speed_close and offset_close):
             return False
 
+        # More tolerant gap prediction
         expected_tv_gap_prev = prev.speed_ratio * max(dvd_gap, 0.0)
-        expected_tv_gap_region = region.speed_ratio * max(dvd_gap, 0.0)
+        expected_tv_gap_region = region.speed_ratio * max(dvd_gap, 0.0) 
         gap_mismatch = min(
             abs(tv_gap - expected_tv_gap_prev),
             abs(tv_gap - expected_tv_gap_region),
         )
-        if gap_mismatch > self.max_gap_mismatch_seconds:
+        
+        gap_mismatch_limit = self.max_gap_mismatch_seconds if conservative else self.max_gap_mismatch_seconds * 1.5
+        if gap_mismatch > gap_mismatch_limit:
             return False
 
+        # More tolerant edge prediction
         pred_region_tv_start = prev.speed_ratio * region.dvd_start + prev.offset_seconds
         pred_prev_tv_end = region.speed_ratio * prev.dvd_end + region.offset_seconds
         edge_error = min(
             abs(region.tv_start - pred_region_tv_start),
             abs(prev.tv_end - pred_prev_tv_end),
         )
-        if edge_error > self.max_edge_prediction_error_seconds:
+        
+        edge_error_limit = self.max_edge_prediction_error_seconds if conservative else self.max_edge_prediction_error_seconds * 1.8
+        if edge_error > edge_error_limit:
             return False
 
         return True
