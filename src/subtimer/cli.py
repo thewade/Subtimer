@@ -130,19 +130,22 @@ def main(
         
         warnings = []
         
-        # Load hints file - from parameter or auto-detect
+        # Load hints file - explicit parameter or auto-detect for hints matcher
         hints_obj = None
         if hints:
+            # Explicit hints file provided
             hints_obj = load_hints_file(hints)
             logger.info(f"Loaded timing hints from {hints} for {hints_obj.episode_id}")
-        else:
-            # Auto-detect hints.yaml in subtitle directory
+        elif matcher == 'hints':
+            # Auto-detect hints.yaml only when using hints matcher
             auto_hints_path = Path(subtitle_file).parent / 'hints.yaml'
             if auto_hints_path.exists():
                 hints_obj = load_hints_file(auto_hints_path)
                 logger.info(f"Auto-detected timing hints from {auto_hints_path} for {hints_obj.episode_id}")
             else:
-                logger.info("No hints file found, using automatic detection only")
+                logger.info("No hints file found for hints matcher, will use basic matching")
+        else:
+            logger.info(f"Using {matcher} matcher - no hints file loading")
         
         # Step 1: Media I/O and Audio Extraction
         logger.info("Step 1: Processing media files")
@@ -241,11 +244,14 @@ def main(
             logger.info("Step 4: Refining alignment")
             
             # TEMPORARY: Skip refiner since it's breaking good correlations
-            logger.info("Bypassing refiner to preserve hint-guided matches")
+            if matcher == 'hints':
+                logger.info("Bypassing refiner to preserve hint-guided matches")
+            else:
+                logger.info("Bypassing refiner to preserve matcher results")
             alignment_map = AlignmentMap(coarse_regions)
             
-            # Validate against hints if available
-            if hints_obj:
+            # Validate against hints only if using hint-guided matcher
+            if hints_obj and matcher == 'hints':
                 hint_warnings = validate_alignment_against_hints(
                     alignment_map.regions, hints_obj, tolerance_seconds=5.0
                 )

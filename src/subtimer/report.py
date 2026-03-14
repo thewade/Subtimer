@@ -51,6 +51,57 @@ class ReportGenerator:
         """
         self.tool_version = tool_version
         
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        """Format seconds as hh:mm:ss.sss string.
+        
+        Args:
+            seconds: Time in seconds.
+            
+        Returns:
+            Formatted time string.
+        """
+        # Handle string inputs that might come from JSON deserialization
+        if isinstance(seconds, str):
+            try:
+                seconds = float(seconds)
+            except (ValueError, TypeError):
+                return "00:00:00.000"  # Default for invalid input
+        
+        # Handle None or other invalid inputs
+        if seconds is None or not isinstance(seconds, (int, float)):
+            return "00:00:00.000"
+            
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+        
+    def _format_offset_seconds(self, offset: float) -> str:
+        """Format offset seconds with proper sign handling.
+        
+        Args:
+            offset: Offset in seconds (can be positive or negative).
+            
+        Returns:
+            Formatted time string with appropriate sign.
+        """
+        # Handle string inputs that might come from JSON deserialization
+        if isinstance(offset, str):
+            try:
+                offset = float(offset)
+            except (ValueError, TypeError):
+                return "00:00:00.000"
+        
+        # Handle None or other invalid inputs
+        if offset is None or not isinstance(offset, (int, float)):
+            return "00:00:00.000"
+            
+        if offset >= 0:
+            return self._format_time(offset)
+        else:
+            return f"-{self._format_time(-offset)}"
+        
     def generate_alignment_json(
         self,
         alignment_map: AlignmentMap,
@@ -152,9 +203,9 @@ class ReportGenerator:
             "matched_regions": len(matched_regions),
             "tv_only_regions": len(tv_only_regions),
             "low_confidence_regions": len(low_confidence_regions),
-            "total_matched_dvd_time": round(total_dvd_time, 2),
-            "total_matched_tv_time": round(total_tv_time, 2),
-            "tv_only_duration": round(tv_only_duration, 2),
+            "total_matched_dvd_time": self._format_time(total_dvd_time),
+            "total_matched_tv_time": self._format_time(total_tv_time),
+            "tv_only_duration": self._format_time(tv_only_duration),
             "average_confidence": round(avg_confidence, 3),
             "average_speed_ratio": round(avg_speed_ratio, 4),
             "speed_difference_percent": round((avg_speed_ratio - 1.0) * 100, 2)
@@ -193,13 +244,13 @@ class ReportGenerator:
         
         for region in alignment_map.regions:
             region_dict = {
-                "dvd_start": round(region.dvd_start, 3),
-                "dvd_end": round(region.dvd_end, 3),
-                "dvd_duration": round(region.dvd_duration, 3),
-                "tv_start": round(region.tv_start, 3),
-                "tv_end": round(region.tv_end, 3),
-                "tv_duration": round(region.tv_duration, 3),
-                "offset_seconds": round(region.offset_seconds, 3),
+                "dvd_start": self._format_time(region.dvd_start),
+                "dvd_end": self._format_time(region.dvd_end),
+                "dvd_duration": self._format_time(region.dvd_duration),
+                "tv_start": self._format_time(region.tv_start),
+                "tv_end": self._format_time(region.tv_end),
+                "tv_duration": self._format_time(region.tv_duration),
+                "offset_seconds": self._format_offset_seconds(region.offset_seconds),
                 "speed_ratio": round(region.speed_ratio, 4),
                 "confidence": round(region.confidence, 3),
                 "region_type": region.region_type.value
@@ -237,8 +288,8 @@ class ReportGenerator:
             if result.action in [CueAction.DROPPED_TV_ONLY, CueAction.DROPPED_UNMATCHED]:
                 dropped.append({
                     "original_index": result.original_cue.index,
-                    "start_time": round(result.original_cue.start_time, 3),
-                    "end_time": round(result.original_cue.end_time, 3),
+                    "start_time": self._format_time(result.original_cue.start_time),
+                    "end_time": self._format_time(result.original_cue.end_time),
                     "text_preview": result.original_cue.text[:100] + "..." if len(result.original_cue.text) > 100 else result.original_cue.text,
                     "reason": result.reason,
                     "action": result.action.value
@@ -261,8 +312,8 @@ class ReportGenerator:
             if result.action in [CueAction.FLAGGED_BOUNDARY, CueAction.FLAGGED_LOW_CONFIDENCE]:
                 flagged.append({
                     "original_index": result.original_cue.index,
-                    "start_time": round(result.original_cue.start_time, 3),
-                    "end_time": round(result.original_cue.end_time, 3),
+                    "start_time": self._format_time(result.original_cue.start_time),
+                    "end_time": self._format_time(result.original_cue.end_time),
                     "text_preview": result.original_cue.text[:100] + "..." if len(result.original_cue.text) > 100 else result.original_cue.text,
                     "reason": result.reason,
                     "confidence": result.confidence,
@@ -310,8 +361,8 @@ class ReportGenerator:
         f.write(f"Matched Regions: {alignment_summary['matched_regions']}\n")
         f.write(f"TV-Only Regions: {alignment_summary['tv_only_regions']}\n")
         f.write(f"Low Confidence Regions: {alignment_summary['low_confidence_regions']}\n")
-        f.write(f"Total Matched DVD Time: {alignment_summary['total_matched_dvd_time']:.1f}s\n")
-        f.write(f"Total TV-Only Time: {alignment_summary['tv_only_duration']:.1f}s\n")
+        f.write(f"Total Matched DVD Time: {alignment_summary['total_matched_dvd_time']}\n")
+        f.write(f"Total TV-Only Time: {alignment_summary['tv_only_duration']}\n")
         f.write(f"Average Confidence: {alignment_summary['average_confidence']:.3f}\n")
         f.write(f"Average Speed Ratio: {alignment_summary['average_speed_ratio']:.4f}\n")
         f.write(f"Speed Difference: {alignment_summary['speed_difference_percent']:+.2f}%\n\n")
@@ -341,8 +392,8 @@ class ReportGenerator:
         regions = self._create_regions_list(alignment_map)
         for i, region in enumerate(regions[:10]):
             f.write(f"Region {i+1}: {region['region_type']}\n")
-            f.write(f"  DVD: {region['dvd_start']:.1f}s - {region['dvd_end']:.1f}s ({region['dvd_duration']:.1f}s)\n")
-            f.write(f"  TV:  {region['tv_start']:.1f}s - {region['tv_end']:.1f}s ({region['tv_duration']:.1f}s)\n")
+            f.write(f"  DVD: {region['dvd_start']} - {region['dvd_end']} ({region['dvd_duration']})\n")
+            f.write(f"  TV:  {region['tv_start']} - {region['tv_end']} ({region['tv_duration']})\n")
             f.write(f"  Speed: {region['speed_ratio']:.4f}x, Confidence: {region['confidence']:.3f}\n")
             if 'interpretation' in region:
                 f.write(f"  {region['interpretation']}\n")
@@ -357,7 +408,7 @@ class ReportGenerator:
             f.write("DROPPED SUBTITLES (first 5)\n")
             f.write("-" * 25 + "\n")
             for subtitle in dropped[:5]:
-                f.write(f"Cue {subtitle['original_index']}: {subtitle['start_time']:.1f}s-{subtitle['end_time']:.1f}s\n")
+                f.write(f"Cue {subtitle['original_index']}: {subtitle['start_time']}-{subtitle['end_time']}\n")
                 f.write(f"  Reason: {subtitle['reason']}\n")
                 f.write(f"  Text: {subtitle['text_preview']}\n\n")
             if len(dropped) > 5:
@@ -368,7 +419,7 @@ class ReportGenerator:
             f.write("FLAGGED SUBTITLES (first 5)\n")
             f.write("-" * 25 + "\n")
             for subtitle in flagged[:5]:
-                f.write(f"Cue {subtitle['original_index']}: {subtitle['start_time']:.1f}s-{subtitle['end_time']:.1f}s\n")
+                f.write(f"Cue {subtitle['original_index']}: {subtitle['start_time']}-{subtitle['end_time']}\n")
                 f.write(f"  Reason: {subtitle['reason']}\n")
                 if subtitle['confidence']:
                     f.write(f"  Confidence: {subtitle['confidence']:.3f}\n")
